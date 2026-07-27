@@ -8,6 +8,7 @@
 //!
 //! Use the [`BufferedOutput`] struct to create a buffered form of the
 //! [`Output`] writer.
+use crate::aligned_buffer::AlignedBuffer;
 use crate::{Output, WriteStat};
 
 /// Buffer partial output blocks until they are completed.
@@ -24,6 +25,13 @@ pub(crate) struct BufferedOutput<'a> {
     /// The size of this buffer is always less than the output block
     /// size (that is, the value of the `obs` command-line option).
     buf: Vec<u8>,
+
+    /// Staging area that keeps the internal buffer's contents aligned.
+    ///
+    /// A descriptor opened with `O_DIRECT` rejects a misaligned buffer, and
+    /// the internal buffer carries no alignment guarantee. `None` when the
+    /// output is not direct, so an ordinary copy pays nothing.
+    staging: Option<(AlignedBuffer, usize)>,
 }
 
 impl<'a> BufferedOutput<'a> {
@@ -36,7 +44,24 @@ impl<'a> BufferedOutput<'a> {
         let obs = inner.settings.obs;
         let mut buf = Vec::new();
         buf.try_reserve(obs)?;
-        Ok(Self { inner, buf })
+        let staging = match inner.direct_write_alignment() {
+            Some(alignment) => Some((AlignedBuffer::try_new(0, alignment)?, alignment)),
+            None => None,
+        };
+        Ok(Self {
+            inner,
+            buf,
+            staging,
+        })
+    }
+
+    /// Writes the internal buffer, aligning it first when the output is direct.
+    fn write_internal_buffer(&mut self) -> std::io::Result<WriteStat> {
+        let source = match &mut self.staging {
+            Some((staging, alignment)) => staging.refill(&self.buf, *alignment)?,
+            None => &self.buf,
+        };
+        self.inner.write_blocks(source)
     }
 
     pub(crate) fn discard_cache(&self, offset: u64, len: u64) {
@@ -45,7 +70,7 @@ impl<'a> BufferedOutput<'a> {
 
     /// Flush the partial block stored in the internal buffer.
     pub(crate) fn flush(&mut self) -> std::io::Result<WriteStat> {
-        let wstat = self.inner.write_blocks(&self.buf)?;
+        let wstat = self.write_internal_buffer()?;
         let n = wstat.bytes_total.try_into().unwrap();
         self.buf.drain(0..n);
         Ok(wstat)
@@ -96,7 +121,7 @@ impl<'a> BufferedOutput<'a> {
         // partial block were `b"ab"` and the new incoming bytes were
         // `b"cdefg"`, then we would write blocks `b"abc"` and
         // b`"def"` to the inner block writer.
-        let wstat = self.inner.write_blocks(&self.buf)?;
+        let wstat = self.write_internal_buffer()?;
 
         // Buffer any remaining bytes as a partial block.
         //
@@ -205,6 +230,7 @@ mod tests {
         let mut output = BufferedOutput {
             inner,
             buf: b"ab".to_vec(),
+            staging: None,
         };
         let wstat = output.write_blocks(b"cdefg").unwrap();
         assert_eq!(wstat.writes_complete, 2);
@@ -226,6 +252,7 @@ mod tests {
         let mut output = BufferedOutput {
             inner,
             buf: b"abc".to_vec(),
+            staging: None,
         };
         let wstat = output.flush().unwrap();
         assert_eq!(wstat.writes_complete, 0);

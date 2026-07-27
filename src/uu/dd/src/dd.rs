@@ -734,6 +734,13 @@ fn is_sparse(buf: &[u8]) -> bool {
     buf.iter().all(|&e| e == 0u8)
 }
 
+impl Output<'_> {
+    /// Returns the buffer alignment a direct write needs, if any.
+    pub(crate) fn direct_write_alignment(&self) -> Option<usize> {
+        self.settings.oflags.direct.then(io_buffer_alignment)
+    }
+}
+
 /// Handle O_DIRECT write errors by temporarily removing the flag and retrying.
 /// This follows GNU dd behavior for partial block writes with O_DIRECT.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1233,7 +1240,7 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
     };
     let mut storage = AlignedBuffer::try_new(bsize, alignment)?;
     let buf = storage.as_mut_slice();
-    let mut conv_buf = Vec::new();
+    let mut conv_buf = AlignedBuffer::try_new(0, alignment)?;
 
     // The main read/write loop.
     //
@@ -1248,7 +1255,7 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         // best buffer size for reading based on the number of
         // blocks already read and the number of blocks remaining.
         let loop_bsize = calc_loop_bsize(i.settings.count, &rstat, i.settings.ibs, bsize);
-        let (rstat_update, data) = read_helper(&mut i, buf, &mut conv_buf, loop_bsize)?;
+        let (rstat_update, data) = read_helper(&mut i, buf, &mut conv_buf, alignment, loop_bsize)?;
         if rstat_update.is_empty() {
             if input_nocache {
                 i.discard_cache(read_offset, 0);
@@ -1388,7 +1395,8 @@ fn make_linux_oflags(oflags: &OFlags) -> Option<libc::c_int> {
 fn read_helper<'a>(
     i: &mut Input,
     buf: &'a mut [u8],
-    conv_scratch: &'a mut Vec<u8>,
+    conv_scratch: &'a mut AlignedBuffer,
+    alignment: usize,
     bsize: usize,
 ) -> io::Result<(ReadStat, &'a [u8])> {
     // Local Helper Fns -------------------------------------------------
@@ -1415,10 +1423,9 @@ fn read_helper<'a>(
 
     match &i.settings.iconv.mode {
         Some(mode) => {
-            *conv_scratch = Vec::new();
-            *conv_scratch =
+            let converted =
                 conv_block_unblock_helper(scratch[..data_len].to_vec(), mode, &mut rstat);
-            Ok((rstat, conv_scratch.as_slice()))
+            Ok((rstat, conv_scratch.refill(&converted, alignment)?))
         }
         None => Ok((rstat, &scratch[..data_len])),
     }
